@@ -1,0 +1,350 @@
+// Load Sentinel-1 C-band SAR Ground Range collection - ASCENDING ORBIT
+var collectionVV = ee.ImageCollection('COPERNICUS/S1_GRD')   
+.filter(ee.Filter.eq('instrumentMode', 'IW'))    
+.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))    
+.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))   
+.filterMetadata('resolution_meters', 'equals' , 10)   
+.filterBounds(roi)
+.select('VV');
+print(collectionVV, 'Collection VV'); 
+var collectionVH= ee.ImageCollection('COPERNICUS/S1_GRD')   
+.filter(ee.Filter.eq('instrumentMode', 'IW'))   
+.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))   
+.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'))   
+.filterMetadata('resolution_meters', 'equals' , 10)   
+.filterBounds(roi)   
+.select('VH');
+print(collectionVH, 'Collection VH');
+
+//Display map in the Area of Interest
+Map.centerObject(Plantation_1,12);
+
+//Time Series for each Plantation with both Polarizations
+//Plantation 1
+/*var chart10 = ui.Chart.image.seriesByRegion(
+collectionVH, Plantation_1, ee.Reducer.mean(), 'VH', 10 ,'system:time_start' , 'Name')
+  .setChartType('ScatterChart')
+  .setOptions({
+    title : 'Time-Series Plantation 1 VH Polarization' ,
+    vAxis: {title: 'VH'},
+    lineWidth: 1,
+    pointSize: 3,
+    series: {
+      0: {color: 'green'},
+      }}); 
+  print (chart10, 'Oil Palm ')
+var chart11 = ui.Chart.image.seriesByRegion(
+collectionVV, Plantation_1, ee.Reducer.mean(), 'VV', 10 ,'system:time_start' , 'Name')
+  .setChartType('ScatterChart')
+  .setOptions({
+    title : 'Time-Series Plantation 1 VV Polarization' ,
+    vAxis: {title: 'VV'},
+    lineWidth: 1,
+    pointSize: 3,
+    series: {
+      0: {color: 'blue'},
+      }}); 
+  print (chart11, 'Oil Palm ')*/
+
+//Function to convert from dB
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select(0).divide(10.0));
+}
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+//Apllying a Refined Lee Speckle filter as coded in the SNAP 3.0 S1TBX://///////
+//https://github.com/senbox-org/s1tbx/blob/master/s1tbx-op-sar-processing/src/main/java/org/esa/s1tbx/sar/gpf/filtering/SpeckleFilters/RefinedLee.java
+/////////////////////Adapted by Guido Lemoine  ////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+
+  // convert to natural.. do not apply function on dB!
+  var myimg = toNatural(img);
+
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = myimg.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = myimg.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = myimg.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = myimg.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(myimg.subtract(dir_mean)));
+  //return(result);
+  return(img.addBands(ee.Image(toDB(result.arrayGet(0))).rename("filter")));
+ 
+}
+
+var collectionVV = collectionVV.map(RefinedLee);
+var collectionVH = collectionVH.map(RefinedLee);
+var colVV_fil = ee.ImageCollection(collectionVH.select("filter"));
+var colVH_fil = ee.ImageCollection(collectionVV.select("filter"));
+
+//chart Plantation 1
+print(ui.Chart.image.series(colVV_fil, Plantation_1, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VV Plantation 1',
+      vAxis: {title: 'VV'},
+      lineWidth: 1,
+      pointSize: 3 }));
+print(ui.Chart.image.series(colVH_fil, Plantation_1, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VH Plantation 1',
+      vAxis: {title: 'VH'},
+      lineWidth: 1,
+      pointSize: 3 }));
+//chart Plantation 2
+print(ui.Chart.image.series(colVV_fil, Plantation_2, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VV Plantation 2',
+      vAxis: {title: 'VV'},
+      lineWidth: 1,
+      pointSize: 3 }));
+print(ui.Chart.image.series(colVH_fil, Plantation_2, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VH Plantation 2',
+      vAxis: {title: 'VH'},
+      lineWidth: 1,
+      pointSize: 3 }));
+//chart Plantation 3
+print(ui.Chart.image.series(colVV_fil, Plantation_3, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VV Plantation 3',
+      vAxis: {title: 'VV'},
+      lineWidth: 1,
+      pointSize: 3 }));
+print(ui.Chart.image.series(colVH_fil, Plantation_3, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VH Plantation 3',
+      vAxis: {title: 'VH'},
+      lineWidth: 1,
+      pointSize: 3 }));
+//chart Plantation 4
+print(ui.Chart.image.series(colVV_fil, Plantation_4, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VV Plantation 4',
+      vAxis: {title: 'VV'},
+      lineWidth: 1,
+      pointSize: 3 }));
+print(ui.Chart.image.series(colVH_fil, Plantation_4, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VH Plantation 4',
+      vAxis: {title: 'VH'},
+      lineWidth: 1,
+      pointSize: 3 }));
+//chart Plantation 5
+print(ui.Chart.image.series(colVV_fil, Plantation_5, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VV Plantation 5',
+      vAxis: {title: 'VV'},
+      lineWidth: 1,
+      pointSize: 3 }));
+print(ui.Chart.image.series(colVH_fil, Plantation_5, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VH Plantation 5',
+      vAxis: {title: 'VH'},
+      lineWidth: 1,
+      pointSize: 3 }));
+//chart Plantation forest
+print(ui.Chart.image.series(colVV_fil, test, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VV Forest',
+      vAxis: {title: 'VV'},
+      lineWidth: 1,
+      pointSize: 3 }));
+print(ui.Chart.image.series(colVH_fil, test, ee.Reducer.mean(), 20).setOptions({
+      title: 'TimeSeries analysis VH Forest',
+      vAxis: {title: 'VH'},
+      lineWidth: 1,
+      pointSize: 3 }));
+
+//////// Time series multiple covers Extend analysis  /////////
+
+// import sentinel 1 and filter data series
+
+
+//filter by date (as a layer) and already smoothed in the precious step
+var VV2015 = colVV_fil.filterDate('2015-04-01', '2015-12-30').mosaic();
+var VH2015 = colVH_fil.filterDate('2015-04-01', '2015-12-30').mosaic();
+var VV2016 = colVV_fil.filterDate('2016-01-01', '2016-12-30').mosaic();
+var VH2016 = colVH_fil.filterDate('2016-01-01', '2016-12-30').mosaic();
+var VV2017 = colVV_fil.filterDate('2017-01-01', '2017-12-30').mosaic();
+var VH2017 = colVH_fil.filterDate('2017-01-01', '2017-12-30').mosaic();
+var VV2018 = colVV_fil.filterDate('2018-01-01', '2018-12-30').mosaic();
+var VH2018 = colVH_fil.filterDate('2018-01-01', '2018-12-30').mosaic();
+var VV2019 = colVV_fil.filterDate('2019-01-01', '2019-12-30').mosaic();
+var VH2019 = colVH_fil.filterDate('2019-01-01', '2019-12-30').mosaic();
+var VV2020 = colVV_fil.filterDate('2020-01-01', '2020-05-30').mosaic();
+var VH2020 = colVH_fil.filterDate('2020-01-01', '2020-05-30').mosaic();
+
+// create band stack adn visualization parameters
+
+var st_VV = VV2015.addBands(VV2016).addBands(VV2017).addBands(VV2018).addBands(VV2019).addBands(VV2020);
+var st_VH = VH2015.addBands(VH2016).addBands(VH2017).addBands(VH2018).addBands(VH2019).addBands(VH2020);
+print('Stacked VV', st_VV );
+print('Stacked VH', st_VH );
+
+var visparamsvv = {bands: ['VV', 'VV_2', 'VV_3'],min: -30,
+  max: 0,gamma: [0.9, 0.8, 0.7]};
+var visparamsvh = {bands: ['VH', 'VH_2', 'VH_3'],min: -30,
+  max: 0,gamma: [0.9, 0.8, 0.7]};
+
+// Display map
+Map.centerObject(Plantation_1, 14);
+// Display composite image
+
+Map.addLayer(st_VV, {min:-30,max:0}, ' VV Filtered',0);
+Map.addLayer(st_VH, {min:-17,max:0}, ' VH Filtered',0);
+
+var optionsvv = {
+  title: 'Time Series VV plot_1',
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Backscatter coefficient (dB)'},
+  lineWidth: 2,
+  pointSize: 4,
+  fontSize:20,
+  series: {
+    0: {color: '970F0F'}, // color1
+    1: {color: 'FF0000'}, // color2
+    2: {color: 'F68244'}, // color3
+    3: {color: '1230D8'}, // color4
+    5: {color: '00F7FF'}, // color5
+    6: {color: '#ff7b58'}, // color6
+    7: {color: '#ffb653'}, // color7
+    8: {color: '#bdff49'}, // color8
+    9: {color: '#41ff80'}, // color9
+    10: {color: '#43cfff'}, // color10
+    11: {color: '#3944ff'}, // color11
+    12: {color: '#d131ff'}, // color12
+    13: {color: '#ff3fa5'}, // color13
+}};
+
+var optionsvh = {
+  title: 'Time Series VH plot_1',
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Backscatter coefficient (dB)'},
+  lineWidth: 2,
+  pointSize: 4,
+  fontSize:20,
+  series: {
+    0: {color: '970F0F'}, // color1
+    1: {color: 'FF0000'}, // color2
+    2: {color: 'F68244'}, // color3
+    3: {color: '1230D8'}, // color4
+    5: {color: '00F7FF'}, // color5
+    6: {color: '#ff7b58'}, // color6
+    7: {color: '#ffb653'}, // color7
+    8: {color: '#bdff49'}, // color8
+    9: {color: '#41ff80'}, // color9
+    10: {color: '#43cfff'}, // color10
+    11: {color: '#3944ff'}, // color11
+    12: {color: '#d131ff'}, // color12
+    13: {color: '#ff3fa5'}, // color13
+}};
+
+
+var dates = ['2015','2016','2017','2018','2019','2020'];
+var Q1 = ee.FeatureCollection([
+  geometry,
+  geometry2,
+  geometry3,
+  geometry4,
+  geometry5,
+  geometry6,
+  geometry7,
+  geometry8,
+  ]);
+
+
+// Create the chart and set options.
+//VV Plot
+var timeChartvvQ1= ui.Chart.image.regions(
+    st_VV, Q1, ee.Reducer.mean(), 30, 'label', dates)
+        .setChartType('LineChart')
+        .setOptions(optionsvv);
+print('Timeseries VV Plot 1',timeChartvvQ1);
+//VH plot
+var timeChartvhQ1 = ui.Chart.image.regions(
+    st_VH, Q1, ee.Reducer.mean(), 30, 'label', dates)
+        .setChartType('LineChart')
+        .setOptions(optionsvh);
+print('Timeseries VH Plot 1',timeChartvhQ1);
+// Display the chart.
+
+Map.centerObject(Plantation_1,13);
+
+  
+ 
