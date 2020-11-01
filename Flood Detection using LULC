@@ -490,7 +490,6 @@ Map.add(results);
 
 //----------------------------- Display legend on the map --------------------------//
 
-// Create legend (*credits to thisearthsite on Open Geo Blog: https://mygeoblog.com/2016/12/09/add-a-legend-to-to-your-gee-map/)
 // set position of panel
 var legend = ui.Panel({
   style: {
